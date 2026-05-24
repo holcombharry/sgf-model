@@ -8,12 +8,22 @@ from sgf_model.projections.rookie import (
     make_rookie_class_from_history,
     project_rookies,
 )
+from sgf_model.projections.team import (
+    apply_team_context,
+    compute_team_volumes,
+    get_player_team_mapping,
+    project_team_volumes,
+)
 
 __all__ = [
+    "apply_team_context",
     "build_rookie_training_data",
+    "compute_team_volumes",
     "fit_regression_priors",
     "fit_rookie_models",
+    "get_player_team_mapping",
     "make_rookie_class_from_history",
     "project_players",
     "project_rookies",
+    "project_team_volumes",
 ]
