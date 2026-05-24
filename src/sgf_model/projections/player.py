@@ -32,6 +32,7 @@ from __future__ import annotations
 import polars as pl
 
 from sgf_model.curves import age_multiplier
+from sgf_model.projections.regression import priors_as_dict
 
 # Stats we project (must have age curves). Anything else from the player_seasons
 # table is dropped — we have no aging information for it.
@@ -74,12 +75,20 @@ def _weighted_history(
     player_history: pl.DataFrame,
     stats: list[str],
     history_weights: tuple[float, ...],
+    priors: dict[tuple[str, str], tuple[float, float]] | None = None,
+    position: str | None = None,
 ) -> dict[str, float] | None:
     """Return weighted per-game baselines + projected games_played for one player.
 
     `player_history` is the player's rows from the player_seasons table,
     already sorted descending by season (most recent first). The most recent
     `len(history_weights)` seasons are used.
+
+    If `priors` is provided, Marcel-style empirical-Bayes shrinkage is applied
+    to each per-game baseline:
+        shrunk = (sample_weight * raw + N * pop_mean) / (sample_weight + N)
+    where `sample_weight` is the player's total weighted game-units of evidence
+    and `N` is the per-stat regression amount derived in `fit_regression_priors`.
     """
     recent = player_history.head(len(history_weights))
     if recent.is_empty():
@@ -99,9 +108,16 @@ def _weighted_history(
             row[stat] / row["games_played"] if row["games_played"] else 0.0
             for row in recent.iter_rows(named=True)
         ]
-        baselines[stat] = sum(w * v for w, v in zip(combined, per_game_values)) / total_weight
+        raw = sum(w * v for w, v in zip(combined, per_game_values)) / total_weight
+        if priors is not None and position is not None and (position, stat) in priors:
+            pop_mean, n = priors[(position, stat)]
+            baselines[stat] = (total_weight * raw + n * pop_mean) / (total_weight + n)
+        else:
+            baselines[stat] = raw
 
     # Games played is its own projection — straight weighted mean over recent seasons.
+    # Not shrunk: games-played has its own dynamics (injury history, age) that the
+    # population mean would obscure. A games-played-vs-age model is the better fix.
     baselines["games_played"] = sum(w * g for w, g in zip(weights, games)) / sum(weights)
     return baselines
 
@@ -112,6 +128,7 @@ def project_players(
     as_of_season: int = 2024,
     n_future_seasons: int = 5,
     history_weights: tuple[float, ...] = (5.0, 4.0, 3.0),
+    regression_priors: pl.DataFrame | None = None,
 ) -> pl.DataFrame:
     """Project per-game and season-total stats forward for every active player.
 
@@ -127,6 +144,11 @@ def project_players(
             most recent first. Defaults to (5, 4, 3): the last season is
             weighted 5x relative to two seasons ago at 3x, before multiplying
             by games played.
+        regression_priors: Optional output of `fit_regression_priors`. When
+            provided, applies empirical-Bayes shrinkage toward the population
+            mean per (position, stat) — recommended for projection quality,
+            especially for small-sample players (rookies, injury-shortened
+            careers). Omit for the raw weighted-history baseline.
 
     Returns:
         Long-format DataFrame with one row per (player, projected_season):
@@ -135,6 +157,8 @@ def project_players(
         Per-game and per-season values are provided for every stat with a
         curve for that position.
     """
+    priors_dict = priors_as_dict(regression_priors) if regression_priors is not None else None
+
     active_ids = (
         player_seasons.filter(pl.col("season") == as_of_season)
         .select("player_id")
@@ -155,7 +179,9 @@ def project_players(
             continue
 
         stats = _PROJECTED_STATS_BY_POSITION[position]
-        baselines = _weighted_history(group, stats, history_weights)
+        baselines = _weighted_history(
+            group, stats, history_weights, priors=priors_dict, position=position
+        )
         if baselines is None or latest["age"] is None:
             continue
 
