@@ -1,13 +1,18 @@
 """Build the (player, season) feature matrix for the FP model.
 
-Each row corresponds to one player-season we may want to model — features come
-strictly from data prior to that season, and the target is the FP that player
-scored in that season (or null for the inference row, when we don't yet know).
+Each row corresponds to one (player, anchor_season, target_season) we may want
+to model — features come strictly from data on or before `anchor_season`, and
+the target is the FP that player scored in `target_season` (or null when
+inferring). `future_offset = target_season - anchor_season` is itself a feature
+so a single model can be trained to predict FP at any horizon.
+
+For Phase 1/2 compatibility, `forecast_horizon=1` produces the same row set
+as the original (anchor_season = season - 1, target_season = season). For
+Phase 3+, set forecast_horizon=N to also emit rows for offsets 2..N.
 
 Phase 1 features are intentionally minimal: age, experience, three prior-season
-FP lags + weighted summary, prior games, and last-year position rank. The point
-of Phase 1 is to validate the top-down architecture beats the v1 Marcel baseline
-*before* investing in advanced metric features (Phase 2).
+FP lags + weighted summary, prior games, and last-year position rank. Phase 2
+adds NGS / snap / draft features. Phase 3 adds future_offset.
 """
 
 from __future__ import annotations
@@ -16,13 +21,10 @@ import polars as pl
 
 from sgf_model.scoring import ScoringConfig, score_projections
 
-# Marcel-style weights matching the v1 baseline. Used to compute weighted prior
-# FP / games features so the model sees an aggregate of recent history alongside
-# the individual lags, which gives LightGBM both raw and pre-smoothed signals.
+# Marcel-style weights used to compute weighted prior FP / games features so
+# the model sees an aggregate of recent history alongside the individual lags.
 _HISTORY_WEIGHTS: tuple[float, float, float] = (5.0, 4.0, 3.0)
 
-# The feature columns the model trains on. Position is handled as a separate
-# per-position model (so it's not in this list) — but everything else is.
 PHASE1_FEATURE_COLUMNS: tuple[str, ...] = (
     "age",
     "experience",
@@ -40,17 +42,13 @@ PHASE1_FEATURE_COLUMNS: tuple[str, ...] = (
     "is_top24_last_year",
 )
 
-# Phase 2 features are the Phase 1 set plus prior-season advanced metrics
-# (snap share + NGS receiving / rushing / passing aggregates) and draft capital.
-# All "prior_*" advanced features are last-year values — they describe how the
-# player performed last year, used to predict this year.
+# Phase 2 advanced features — joined at anchor_season so they describe what the
+# player did most recently before projection time.
 PHASE2_ADVANCED_COLUMNS: tuple[str, ...] = (
-    # Snap features (broad coverage, 2012+)
     "prior_snap_share_mean",
     "prior_snap_share_max",
     "prior_snap_games",
     "prior_offense_snaps_total",
-    # NGS receiving (top WR/TE only, 2016+)
     "prior_ngs_separation",
     "prior_ngs_cushion",
     "prior_ngs_adot",
@@ -58,28 +56,26 @@ PHASE2_ADVANCED_COLUMNS: tuple[str, ...] = (
     "prior_ngs_yac",
     "prior_ngs_yac_oe",
     "prior_ngs_air_yard_share",
-    # NGS rushing (top RB only, 2016+)
     "prior_ngs_rush_efficiency",
     "prior_ngs_ryoe_per_att",
     "prior_ngs_rush_pct_oe",
     "prior_ngs_time_to_los",
     "prior_ngs_pct_8plus_box",
-    # NGS passing (most starting QBs, 2016+)
     "prior_ngs_cpoe",
     "prior_ngs_time_to_throw",
     "prior_ngs_aggressiveness",
     "prior_ngs_qb_adot",
     "prior_ngs_air_yards_to_sticks",
-    # Draft capital (no season dim, joined per-player)
     "draft_round",
     "draft_pick",
     "draft_pick_log",
 )
 PHASE2_FEATURE_COLUMNS: tuple[str, ...] = PHASE1_FEATURE_COLUMNS + PHASE2_ADVANCED_COLUMNS
 
-# Stat columns we need from player_seasons before applying score_projections.
-# score_projections expects `{stat}_season` naming, but load_player_seasons emits
-# bare names — we rename inside this module to keep that detail local.
+# Phase 3 adds future_offset so the same model can predict at multiple horizons.
+PHASE3_FEATURE_COLUMNS: tuple[str, ...] = PHASE2_FEATURE_COLUMNS + ("future_offset",)
+
+
 _STAT_COLS_RENAME: dict[str, str] = {
     "passing_yards": "passing_yards_season",
     "passing_tds": "passing_tds_season",
@@ -97,10 +93,7 @@ _STAT_COLS_RENAME: dict[str, str] = {
 def _score_history(
     player_seasons: pl.DataFrame, scoring: ScoringConfig
 ) -> pl.DataFrame:
-    """Compute fp_season per (player, season) under the given scoring.
-
-    Returns a slim frame with `player_id, season, position, fp_season, games_played`.
-    """
+    """Compute fp_season per (player, season) under the given scoring."""
     renamed = player_seasons.rename(
         {k: v for k, v in _STAT_COLS_RENAME.items() if k in player_seasons.columns}
     )
@@ -116,35 +109,41 @@ def _score_history(
     )
 
 
-def _add_lag(
+def _add_lag_from_anchor(
     target: pl.DataFrame,
     history: pl.DataFrame,
     lag: int,
 ) -> pl.DataFrame:
-    """Left-join `history` shifted by `lag` calendar years onto `target`.
+    """Join `history.fp_season` from `anchor_season - (lag - 1)` years onto each target row.
 
-    Result adds `prior_fp_{lag}y` and `prior_games_{lag}y` columns. Null when
-    the player didn't play (or didn't exist) that many years prior — which is
-    a legitimate signal, not missing data, so we leave nulls as nulls. LightGBM
-    routes nulls natively.
+    Convention:
+      lag=1 → FP at anchor_season       (most recent observed)
+      lag=2 → FP at anchor_season - 1
+      lag=3 → FP at anchor_season - 2
+
+    For the common case where future_offset=1 (target_season = anchor_season+1),
+    this matches the Phase 1/2 semantic where prior_fp_1y was "FP at target-1".
+    For larger offsets, it correctly clamps to data the model could have at
+    projection time (no leakage from years between anchor and target).
     """
+    shift_back = lag - 1
     return target.join(
         history.select(
             "player_id",
-            (pl.col("season") + lag).alias("season"),
+            (pl.col("season") + shift_back).alias("anchor_season"),
             pl.col("fp_season").alias(f"prior_fp_{lag}y"),
             pl.col("games_played").cast(pl.Float64).alias(f"prior_games_{lag}y"),
         ),
-        on=["player_id", "season"],
+        on=["player_id", "anchor_season"],
         how="left",
     )
 
 
-def _add_position_rank_last_year(
+def _add_position_rank_at_anchor(
     target: pl.DataFrame,
     history: pl.DataFrame,
 ) -> pl.DataFrame:
-    """Add the player's prior-season position-rank (1 = top scorer) and flags."""
+    """Position rank at anchor_season (1 = top scorer that year) and top-N flags."""
     ranked = history.with_columns(
         pl.col("fp_season").rank(method="ordinal", descending=True)
         .over(["position", "season"])
@@ -152,10 +151,10 @@ def _add_position_rank_last_year(
         .alias("position_rank")
     ).select(
         "player_id",
-        (pl.col("season") + 1).alias("season"),
+        pl.col("season").alias("anchor_season"),
         pl.col("position_rank").alias("position_rank_last_year"),
     )
-    out = target.join(ranked, on=["player_id", "season"], how="left")
+    out = target.join(ranked, on=["player_id", "anchor_season"], how="left")
     return out.with_columns(
         is_top12_last_year=(pl.col("position_rank_last_year") <= 12).cast(pl.Int8),
         is_top24_last_year=(pl.col("position_rank_last_year") <= 24).cast(pl.Int8),
@@ -163,19 +162,12 @@ def _add_position_rank_last_year(
 
 
 def _weighted_history(df: pl.DataFrame) -> pl.DataFrame:
-    """Compute Marcel-style weighted prior FP, games, and per-game rate.
-
-    Weights ignore lags where the player didn't play (null gets weight 0). This
-    way a player with only 1 prior season still gets a clean weighted estimate
-    instead of being dragged down by nulls.
-    """
+    """Marcel-style weighted prior FP, games, and per-game rate from the 3 lags."""
     w1, w2, w3 = _HISTORY_WEIGHTS
     weights = [w1, w2, w3]
     fps = ["prior_fp_1y", "prior_fp_2y", "prior_fp_3y"]
     gps = ["prior_games_1y", "prior_games_2y", "prior_games_3y"]
 
-    # numerator = sum(w_i * x_i) where x_i is null-safe (treated as 0 in product
-    # but the denominator below excludes that lag entirely).
     fp_num = sum(w * pl.col(c).fill_null(0.0) for w, c in zip(weights, fps))
     fp_den = sum(w * pl.col(c).is_not_null().cast(pl.Float64) for w, c in zip(weights, fps))
     games_num = sum(w * pl.col(c).fill_null(0.0) for w, c in zip(weights, gps))
@@ -185,48 +177,42 @@ def _weighted_history(df: pl.DataFrame) -> pl.DataFrame:
         prior_fp_weighted=pl.when(fp_den > 0).then(fp_num / fp_den).otherwise(None),
         prior_games_weighted=pl.when(games_den > 0).then(games_num / games_den).otherwise(None),
     ).with_columns(
-        # Per-game rate uses raw sums (not weighted ratio) so it stays a true rate.
         prior_fp_per_game_weighted=pl.when(
             (games_num > 0) & (fp_den > 0)
         ).then(fp_num / games_num).otherwise(None),
     )
 
 
-def _experience(df: pl.DataFrame, history: pl.DataFrame) -> pl.DataFrame:
-    """Number of prior NFL seasons in our data — proxy for years in the league.
-
-    Doesn't include the current season (the row being modeled).
-    """
+def _experience_at_anchor(df: pl.DataFrame, history: pl.DataFrame) -> pl.DataFrame:
+    """Number of prior NFL seasons in our data with season <= anchor_season."""
     h = history.select("player_id", pl.col("season").alias("hist_season"))
-    pairs = df.select("player_id", "season").unique().join(h, on="player_id", how="left")
+    pairs = df.select("player_id", "anchor_season").unique().join(
+        h, on="player_id", how="left"
+    )
     counts = (
-        pairs.filter(pl.col("hist_season") < pl.col("season"))
-        .group_by(["player_id", "season"])
+        pairs.filter(pl.col("hist_season") <= pl.col("anchor_season"))
+        .group_by(["player_id", "anchor_season"])
         .agg(pl.len().alias("experience"))
     )
-    return df.join(counts, on=["player_id", "season"], how="left").with_columns(
+    return df.join(counts, on=["player_id", "anchor_season"], how="left").with_columns(
         experience=pl.col("experience").fill_null(0).cast(pl.Int64)
     )
 
 
-def _join_advanced_lagged(
-    df: pl.DataFrame,
-    advanced: pl.DataFrame,
-) -> pl.DataFrame:
-    """Join advanced (player, season) features with a 1-year lag.
+def _join_advanced_at_anchor(df: pl.DataFrame, advanced: pl.DataFrame) -> pl.DataFrame:
+    """Join advanced (player, season) features at anchor_season.
 
-    Advanced features describe what a player did *last* season — we use them to
-    predict *this* season. So we add 1 to advanced.season before joining, which
-    turns "2022 separation" into "the prior_ngs_separation column for the 2023
-    target row".
+    Advanced features describe what a player did at `anchor_season`; the model
+    uses them to predict future-year FP. Columns get a `prior_` prefix to
+    distinguish from raw features (since they're pre-projection signals).
     """
     feature_cols = [c for c in advanced.columns if c not in ("player_id", "season")]
-    shifted = advanced.select(
+    keyed = advanced.select(
         "player_id",
-        (pl.col("season") + 1).alias("season"),
+        pl.col("season").alias("anchor_season"),
         *[pl.col(c).alias(f"prior_{c}") for c in feature_cols],
     )
-    return df.join(shifted, on=["player_id", "season"], how="left")
+    return df.join(keyed, on=["player_id", "anchor_season"], how="left")
 
 
 def _join_draft(df: pl.DataFrame, draft: pl.DataFrame) -> pl.DataFrame:
@@ -234,96 +220,119 @@ def _join_draft(df: pl.DataFrame, draft: pl.DataFrame) -> pl.DataFrame:
     return df.join(draft, on="player_id", how="left")
 
 
+def _build_target_rows(
+    history: pl.DataFrame,
+    inference_season: int | None,
+    forecast_horizon: int,
+) -> pl.DataFrame:
+    """Enumerate (player, anchor_season, future_offset) → target_season rows.
+
+    Training rows: every historical (player, anchor_season) gets one row per
+    valid offset in 1..forecast_horizon where target_season = anchor_season + offset
+    has a realized FP for that player. Player-season pairs without realized FP
+    at target_season are dropped (they don't contribute to training).
+
+    Inference rows: a single anchor_season = inference_season - 1 with one row
+    per offset in 1..forecast_horizon, target_fp null.
+    """
+    anchors = history.select(
+        "player_id", "player_name", "position", "birth_date",
+        pl.col("season").alias("anchor_season"),
+    ).unique()
+
+    offsets = pl.DataFrame({"future_offset": list(range(1, forecast_horizon + 1))})
+    train_rows = anchors.join(offsets, how="cross").with_columns(
+        target_season=pl.col("anchor_season") + pl.col("future_offset"),
+    )
+
+    # Pull realized target FP if it exists. Inner join — drops anchors+offsets
+    # where the player didn't actually play at target_season (so we don't train
+    # on zero-FP retirement seasons that aren't in the data; this is a known
+    # limitation discussed in docs/phase3-results.md).
+    target_fps = history.select(
+        "player_id",
+        pl.col("season").alias("target_season"),
+        pl.col("fp_season").alias("target_fp"),
+    )
+    train_rows = train_rows.join(target_fps, on=["player_id", "target_season"], how="inner")
+
+    if inference_season is None:
+        return train_rows
+
+    # Inference: build rows for inference_season + (offset - 1) where anchor is
+    # inference_season - 1. Active = played in inference_season - 1.
+    active = history.filter(pl.col("season") == inference_season - 1).select(
+        "player_id", "player_name", "position", "birth_date",
+        pl.col("season").alias("anchor_season"),
+    )
+    inference_rows = active.join(offsets, how="cross").with_columns(
+        target_season=pl.col("anchor_season") + pl.col("future_offset"),
+        target_fp=pl.lit(None, dtype=pl.Float64),
+    )
+    return pl.concat([train_rows, inference_rows], how="diagonal")
+
+
 def build_feature_matrix(
     player_seasons: pl.DataFrame,
     scoring: ScoringConfig,
     inference_season: int | None = None,
+    forecast_horizon: int = 1,
     min_prior_seasons: int = 1,
     advanced_features: pl.DataFrame | None = None,
     draft_features: pl.DataFrame | None = None,
 ) -> pl.DataFrame:
-    """Build the (player, season) feature matrix for training and/or inference.
+    """Build the (player, anchor_season, future_offset) feature matrix.
 
     Args:
         player_seasons: Output of `load_player_seasons` — one row per
             (player, season) with raw stats, games_played, birth_date.
-        scoring: ScoringConfig used to compute FP-based features and the target.
-            Both target and historical features must use the same scoring so the
-            model sees consistent units.
-        inference_season: If provided, emits one row per active player at
-            `inference_season` for prediction. Features come from historical
-            data through `inference_season - 1`; target is null (we don't know).
-            If None, emits training rows only.
-        min_prior_seasons: Drop training rows with fewer prior seasons than this.
-            Default 1 — rookies (zero prior seasons) are excluded from training
-            since their feature vector is mostly null. Inference rows are kept
-            regardless so rookies still get predictions (with null-handling by
-            the model).
-        advanced_features: Optional output of `build_advanced_features()` —
-            per-(player, season) snap and NGS features. Joined with a 1-year
-            lag so the model sees prior-season values. Columns get a `prior_`
-            prefix. Pass None for the Phase 1 feature set.
-        draft_features: Optional output of `compute_draft_features()` — per-player
-            demographic columns (round, pick, log-pick). Joined per-player
-            (every season row gets the same draft features). Pass None for the
-            Phase 1 feature set.
+        scoring: ScoringConfig used to compute FP-based features and target.
+        inference_season: If set, emits inference rows for this season at each
+            offset (anchor_season = inference_season - 1, target_season =
+            inference_season .. inference_season + horizon - 1). target_fp null.
+        forecast_horizon: Number of future-year offsets to emit per anchor.
+            Default 1 reproduces Phase 1/2 behavior. Phase 3 uses larger values.
+        min_prior_seasons: Drop training rows with experience < this. Default 1.
+        advanced_features: Optional output of `build_advanced_features()`. Joined
+            at anchor_season with a `prior_` prefix.
+        draft_features: Optional output of `compute_draft_features()`. Joined
+            per-player (constant across season rows).
 
     Returns:
-        DataFrame with Phase 1 columns plus, if advanced/draft passed in,
-        the PHASE2_ADVANCED_COLUMNS feature set.
+        DataFrame with columns:
+            player_id, player_name, position,
+            anchor_season, target_season, future_offset, target_fp,
+            <feature columns: age, experience, prior_*, draft_*>
+
+        For backward compatibility, a `season` column (= target_season) is also
+        emitted so downstream code that filters/groups on `season` still works.
     """
     history = _score_history(player_seasons, scoring)
+    targets = _build_target_rows(history, inference_season, forecast_horizon)
 
-    # Build the target row set: every player-season is potentially a training row;
-    # for inference, additionally include a row for each player active at
-    # inference_season - 1 (we predict their inference_season output).
-    training_targets = history.select(
-        "player_id", "player_name", "position", "season", "birth_date",
-        pl.col("fp_season").alias("target_fp"),
-    )
-
-    if inference_season is not None:
-        # An "active" player at inference_season is one who played in inference_season - 1.
-        # (More elaborate definitions can come later; this matches how the v1 pipeline
-        # decides who to project.)
-        active_last_year = history.filter(pl.col("season") == inference_season - 1).select(
-            "player_id", "player_name", "position", "birth_date",
-        )
-        inference_rows = active_last_year.with_columns(
-            season=pl.lit(inference_season).cast(pl.Int32),
-            target_fp=pl.lit(None, dtype=pl.Float64),
-        )
-        targets = pl.concat([training_targets, inference_rows], how="diagonal")
-    else:
-        targets = training_targets
-
-    # Add lagged FP and games for the last 3 calendar years.
+    # Lagged FP and games from anchor_season backwards.
     out = targets
     for lag in (1, 2, 3):
-        out = _add_lag(out, history, lag)
+        out = _add_lag_from_anchor(out, history, lag)
 
-    # Position-rank features.
-    out = _add_position_rank_last_year(out, history)
-
-    # Weighted-history features and per-game rate.
+    out = _add_position_rank_at_anchor(out, history)
     out = _weighted_history(out)
 
-    # Age (in the target season).
+    # Age at target_season (so a player at anchor=2022 projected for target=2024
+    # is treated as age-at-2024 when ageing-related effects matter).
     out = out.with_columns(
-        age=(pl.col("season") - pl.col("birth_date").dt.year()).cast(pl.Float64)
+        age=(pl.col("target_season") - pl.col("birth_date").dt.year()).cast(pl.Float64),
+        future_offset=pl.col("future_offset").cast(pl.Float64),
     ).drop("birth_date")
 
-    # Experience (count of prior seasons in our data).
-    out = _experience(out, history)
+    out = _experience_at_anchor(out, history)
 
-    # Optional advanced/draft features (Phase 2+).
     if advanced_features is not None:
-        out = _join_advanced_lagged(out, advanced_features)
+        out = _join_advanced_at_anchor(out, advanced_features)
     if draft_features is not None:
         out = _join_draft(out, draft_features)
 
-    # Drop training rows that lack any history (rookies in training). Inference
-    # rows are kept regardless — they need predictions even with sparse features.
+    # Filter training rookies (no history). Inference rows are always kept.
     out = out.with_columns(
         _has_history=pl.col("prior_fp_1y").is_not_null()
             | pl.col("prior_fp_2y").is_not_null()
@@ -332,4 +341,8 @@ def build_feature_matrix(
     )
     out = out.filter(pl.col("_is_inference") | (pl.col("_has_history") &
                      (pl.col("experience") >= min_prior_seasons)))
-    return out.drop(["_has_history", "_is_inference"])
+
+    # `season` alias to target_season for backward compat.
+    return out.drop(["_has_history", "_is_inference"]).with_columns(
+        season=pl.col("target_season"),
+    )

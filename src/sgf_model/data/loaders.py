@@ -90,10 +90,17 @@ def load_player_seasons(
     """
     weekly = filter_fantasy_positions(load_weekly_stats(seasons=list(range(start, end + 1))))
 
-    agg_exprs = [pl.len().alias("games_played")] + [
-        pl.col(c).sum().alias(c) for c in _SEASON_SUM_STATS
-    ]
-    season = weekly.group_by(["player_id", "player_name", "position", "season"]).agg(agg_exprs)
+    # Group by (player_id, season) only — `player_name` and `position` can vary
+    # week-to-week for the same gsis_id (different name spellings, mid-season
+    # position reclassifications) which would otherwise split one player-season
+    # into multiple rows. We pick the most-frequent name/position per group to
+    # keep downstream joins one-row-per-(player, season).
+    agg_exprs = [
+        pl.col("player_name").mode().first().alias("player_name"),
+        pl.col("position").mode().first().alias("position"),
+        pl.len().alias("games_played"),
+    ] + [pl.col(c).sum().alias(c) for c in _SEASON_SUM_STATS]
+    season = weekly.group_by(["player_id", "season"]).agg(agg_exprs)
 
     players = load_players().select(
         pl.col("gsis_id"),

@@ -16,6 +16,7 @@ from sgf_model.features.advanced import (
 from sgf_model.features.builder import (
     PHASE1_FEATURE_COLUMNS,
     PHASE2_FEATURE_COLUMNS,
+    PHASE3_FEATURE_COLUMNS,
     build_feature_matrix,
 )
 
@@ -29,4 +30,5 @@ __all__ = [
     "compute_snap_features",
     "PHASE1_FEATURE_COLUMNS",
     "PHASE2_FEATURE_COLUMNS",
+    "PHASE3_FEATURE_COLUMNS",
 ]
