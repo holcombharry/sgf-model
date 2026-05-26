@@ -137,6 +137,89 @@ def compute_ngs_passing_features(seasons: list[int]) -> pl.DataFrame:
     )
 
 
+PARTICIPATION_FIRST_SEASON: int = 2016
+
+
+def compute_route_features(
+    seasons: list[int],
+    player_seasons: pl.DataFrame,
+) -> pl.DataFrame:
+    """Per-route metrics derived from play-level participation data.
+
+    Computes for each (player_id, season):
+        routes_run             — count of pass plays where the player was on the
+                                 field (from participation.offense_players filtered
+                                 to plays with a non-null `route` value).
+        yprr                   — receiving_yards / routes_run.
+        targets_per_route      — targets / routes_run.
+        td_rate_per_route      — receiving_tds / routes_run.
+
+    These are the canonical talent metrics for receivers / pass-catching backs.
+    They discriminate elites better than aggregate FP because they measure
+    *productivity per opportunity* — the underlying signal in "high YPRR on
+    limited routes = breakout candidate" patterns.
+
+    Note: `routes_run` is an over-count for RBs who blocked on pass plays
+    (they're in offense_players but not running a route). For WR/TE the
+    over-count is small. The ratio metrics (YPRR etc.) are still meaningful
+    because the denominator inflation is roughly proportional to opportunity.
+
+    Participation data exists 2016+; pre-2016 seasons get null routes features.
+    Players in seasons where they had zero routes_run get null rate features
+    (we don't want 0/0 metrics polluting the model).
+    """
+    valid_seasons = [s for s in seasons if s >= PARTICIPATION_FIRST_SEASON]
+    if not valid_seasons:
+        return pl.DataFrame(schema={
+            "player_id": pl.String, "season": pl.Int32,
+            "routes_run": pl.Int64, "yprr": pl.Float64,
+            "targets_per_route": pl.Float64, "td_rate_per_route": pl.Float64,
+        })
+
+    part = nfl.load_participation(seasons=valid_seasons)
+    # Filter to pass plays (those with a logged route concept).
+    pass_plays = part.filter(
+        pl.col("route").is_not_null() & (pl.col("route") != "")
+    )
+    # Extract season from nflverse_game_id (format: "YYYY_WW_AWAY_HOME").
+    pass_plays = pass_plays.with_columns(
+        season=pl.col("nflverse_game_id").str.slice(0, 4).cast(pl.Int32),
+    )
+    # Explode offense_players (semicolon-separated GSIS ids) into one row per (player, play).
+    exploded = pass_plays.select(
+        "season",
+        pl.col("offense_players").str.split(";").alias("player_id"),
+    ).explode("player_id")
+    routes = (
+        exploded.group_by(["player_id", "season"])
+        .agg(routes_run=pl.len())
+    )
+
+    # Join to season stats for the per-route rates.
+    stats = player_seasons.select(
+        "player_id", "season",
+        pl.col("targets").alias("season_targets"),
+        pl.col("receiving_yards").alias("season_rec_yards"),
+        pl.col("receiving_tds").alias("season_rec_tds"),
+    ).with_columns(season=pl.col("season").cast(pl.Int32))
+
+    out = routes.join(stats, on=["player_id", "season"], how="left")
+    return out.with_columns(
+        yprr=pl.when(pl.col("routes_run") > 0)
+            .then(pl.col("season_rec_yards") / pl.col("routes_run"))
+            .otherwise(None),
+        targets_per_route=pl.when(pl.col("routes_run") > 0)
+            .then(pl.col("season_targets") / pl.col("routes_run"))
+            .otherwise(None),
+        td_rate_per_route=pl.when(pl.col("routes_run") > 0)
+            .then(pl.col("season_rec_tds") / pl.col("routes_run"))
+            .otherwise(None),
+    ).select(
+        "player_id", "season", "routes_run",
+        "yprr", "targets_per_route", "td_rate_per_route",
+    )
+
+
 def compute_draft_features(players: pl.DataFrame) -> pl.DataFrame:
     """Per-player demographic features (draft capital). No season dimension —
     these are constant per player and join to every season's row.
@@ -155,15 +238,21 @@ def compute_draft_features(players: pl.DataFrame) -> pl.DataFrame:
 def build_advanced_features(
     seasons: list[int],
     players: pl.DataFrame,
+    player_seasons: pl.DataFrame | None = None,
 ) -> pl.DataFrame:
     """Join all advanced per-(player, season) feature tables.
 
-    Returns a DataFrame keyed by (player_id, season) with snap and NGS features
-    populated when available, null otherwise. Use this output as the
-    `advanced_features` argument to `features.builder.build_feature_matrix`.
+    Returns a DataFrame keyed by (player_id, season) with snap, NGS, and
+    (when `player_seasons` is provided) routes-derived features populated when
+    available, null otherwise. Use this output as the `advanced_features`
+    argument to `features.builder.build_feature_matrix`.
 
     Note: `draft_features` is not joined here — it has no season dimension and
     is joined by the master builder directly so it applies to every season row.
+
+    Routes features require player_seasons (for season-level target/yard
+    totals) and add ~30s of compute time. If you don't need them (e.g., quick
+    tests), omit player_seasons.
     """
     snap = compute_snap_features(seasons, players)
     rec = compute_ngs_receiving_features(seasons)
@@ -172,4 +261,7 @@ def build_advanced_features(
     out = snap
     for other in (rec, rush, pas):
         out = out.join(other, on=["player_id", "season"], how="full", coalesce=True)
+    if player_seasons is not None:
+        routes = compute_route_features(seasons, player_seasons)
+        out = out.join(routes, on=["player_id", "season"], how="full", coalesce=True)
     return out.sort(["player_id", "season"])

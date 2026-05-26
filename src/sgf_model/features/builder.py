@@ -75,6 +75,18 @@ PHASE2_FEATURE_COLUMNS: tuple[str, ...] = PHASE1_FEATURE_COLUMNS + PHASE2_ADVANC
 # Phase 3 adds future_offset so the same model can predict at multiple horizons.
 PHASE3_FEATURE_COLUMNS: tuple[str, ...] = PHASE2_FEATURE_COLUMNS + ("future_offset",)
 
+# Phase 5 adds routes-derived per-opportunity rates — the talent metrics that
+# discriminate elites at the feature level (YPRR, target rate per route, TD rate
+# per route). Available 2016+ from participation data. Address the elite-tier
+# under-coverage identified in docs/phase4-career-calibration.md.
+PHASE5_ROUTES_COLUMNS: tuple[str, ...] = (
+    "prior_routes_run",
+    "prior_yprr",
+    "prior_targets_per_route",
+    "prior_td_rate_per_route",
+)
+PHASE5_FEATURE_COLUMNS: tuple[str, ...] = PHASE3_FEATURE_COLUMNS + PHASE5_ROUTES_COLUMNS
+
 
 _STAT_COLS_RENAME: dict[str, str] = {
     "passing_yards": "passing_yards_season",
