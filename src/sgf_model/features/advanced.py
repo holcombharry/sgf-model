@@ -235,6 +235,38 @@ def compute_draft_features(players: pl.DataFrame) -> pl.DataFrame:
     )
 
 
+def compute_rookies(
+    players: pl.DataFrame,
+    min_draft_year: int,
+    max_draft_year: int,
+) -> pl.DataFrame:
+    """Per-rookie metadata for synthetic pre-rookie anchor rows.
+
+    Returns one row per drafted fantasy-position player with a known draft year
+    in [min_draft_year, max_draft_year] and a parseable birth date. The feature
+    builder uses this to construct anchor_season = draft_year - 1 rows so the
+    model sees rookie-year (and year 2..N) outcomes during training, and can
+    project incoming rookies who have no prior NFL data.
+
+    UDFAs (draft_year is null) are excluded. They're a known limitation — would
+    need a separate signal (e.g., undrafted-rookie roster status) to model.
+    """
+    from sgf_model.data.loaders import FANTASY_POSITIONS
+
+    return players.select(
+        pl.col("gsis_id").alias("player_id"),
+        pl.col("display_name").alias("player_name"),
+        pl.col("position"),
+        pl.col("birth_date").str.to_date("%Y-%m-%d", strict=False),
+        pl.col("draft_year").cast(pl.Int64),
+    ).filter(
+        pl.col("position").is_in(FANTASY_POSITIONS)
+        & pl.col("draft_year").is_not_null()
+        & pl.col("draft_year").is_between(min_draft_year, max_draft_year)
+        & pl.col("birth_date").is_not_null()
+    )
+
+
 def build_advanced_features(
     seasons: list[int],
     players: pl.DataFrame,

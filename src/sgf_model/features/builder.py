@@ -28,6 +28,7 @@ _HISTORY_WEIGHTS: tuple[float, float, float] = (5.0, 4.0, 3.0)
 PHASE1_FEATURE_COLUMNS: tuple[str, ...] = (
     "age",
     "experience",
+    "is_rookie",
     "prior_fp_1y",
     "prior_fp_2y",
     "prior_fp_3y",
@@ -321,6 +322,96 @@ def _build_target_rows(
     return pl.concat([train_rows, inference_rows], how="diagonal")
 
 
+def _build_rookie_anchor_rows(
+    history: pl.DataFrame,
+    rookies: pl.DataFrame,
+    inference_season: int | None,
+    forecast_horizon: int,
+    include_inactive_targets: bool,
+) -> pl.DataFrame | None:
+    """Synthetic pre-rookie anchor rows: anchor_season = draft_year - 1.
+
+    For past rookies (draft_year + future_offset <= last training season):
+    target_fp is realized FP (or 0 for inactive — same first-inactive-only
+    filter as veterans). Teaches the model what happens given just draft
+    capital + age + position with no NFL history.
+
+    For incoming rookies (draft_year == inference_season): target_fp is null,
+    one row per future_offset. Lets the simulator project a player who has
+    never played a snap.
+
+    All rookie rows carry the `_is_rookie_anchor=1` flag so the master filter
+    can pass them through (their `_has_history` is false by construction).
+    """
+    if rookies is None or rookies.height == 0:
+        return None
+
+    last_training_season = int(history["season"].max())
+    offsets = pl.DataFrame({"future_offset": list(range(1, forecast_horizon + 1))})
+
+    # Cast anchor_season to match history.season's dtype so downstream
+    # diagonal concats and joins line up. target_season is naturally Int64
+    # via the offsets DataFrame and matches the veteran target-row schema.
+    history_season_dtype = history.schema["season"]
+    anchors = rookies.select(
+        "player_id", "player_name", "position", "birth_date",
+        (pl.col("draft_year") - 1).cast(history_season_dtype).alias("anchor_season"),
+    )
+    rows = anchors.join(offsets, how="cross").with_columns(
+        target_season=pl.col("anchor_season") + pl.col("future_offset"),
+    )
+
+    # Inference rookie rows: only those whose draft_year == inference_season,
+    # so anchor_season = inference_season - 1 and all targets are post-cutoff.
+    if inference_season is not None:
+        inference_rows = rows.filter(
+            pl.col("anchor_season") == inference_season - 1
+        ).with_columns(target_fp=pl.lit(None, dtype=pl.Float64))
+    else:
+        inference_rows = None
+
+    # Training rookie rows: every (rookie, offset) whose target_season is in our
+    # data window, with realized target_fp from history (0 if didn't play).
+    target_fps = history.select(
+        "player_id",
+        pl.col("season").alias("target_season"),
+        pl.col("fp_season").alias("target_fp"),
+    )
+
+    train_candidates = rows.filter(pl.col("target_season") <= last_training_season)
+    if include_inactive_targets:
+        train_rows = (
+            train_candidates.join(target_fps, on=["player_id", "target_season"], how="left")
+            .with_columns(target_fp=pl.col("target_fp").fill_null(0.0))
+        )
+        # Same first-inactive-only filter as the veteran path: keep all active
+        # rows + the first inactive row per (player, anchor) — preserves the
+        # active→inactive transition without flooding the model with zero rows.
+        train_rows = train_rows.with_columns(
+            _is_inactive=(pl.col("target_fp") == 0).cast(pl.Int8),
+        )
+        train_rows = train_rows.with_columns(
+            _first_inactive_offset=pl.col("future_offset")
+                .filter(pl.col("_is_inactive") == 1)
+                .min()
+                .over(["player_id", "anchor_season"]),
+        )
+        train_rows = train_rows.filter(
+            (pl.col("_is_inactive") == 0)
+            | (pl.col("future_offset") == pl.col("_first_inactive_offset"))
+        ).drop(["_is_inactive", "_first_inactive_offset"])
+    else:
+        train_rows = train_candidates.join(
+            target_fps, on=["player_id", "target_season"], how="inner"
+        )
+
+    pieces = [train_rows]
+    if inference_rows is not None:
+        pieces.append(inference_rows)
+    out = pl.concat(pieces, how="diagonal")
+    return out.with_columns(_is_rookie_anchor=pl.lit(1, dtype=pl.Int8))
+
+
 def build_feature_matrix(
     player_seasons: pl.DataFrame,
     scoring: ScoringConfig,
@@ -329,6 +420,7 @@ def build_feature_matrix(
     min_prior_seasons: int = 1,
     advanced_features: pl.DataFrame | None = None,
     draft_features: pl.DataFrame | None = None,
+    rookies: pl.DataFrame | None = None,
     include_inactive_targets: bool = True,
 ) -> pl.DataFrame:
     """Build the (player, anchor_season, future_offset) feature matrix.
@@ -347,6 +439,11 @@ def build_feature_matrix(
             at anchor_season with a `prior_` prefix.
         draft_features: Optional output of `compute_draft_features()`. Joined
             per-player (constant across season rows).
+        rookies: Optional output of `compute_rookies()`. When provided, emits
+            synthetic pre-rookie anchor rows (anchor_season = draft_year - 1)
+            so the model trains on rookie outcomes and can project incoming
+            rookies at inference_season. Without this, rookies are silently
+            dropped from training and absent from inference.
 
     Returns:
         DataFrame with columns:
@@ -361,7 +458,14 @@ def build_feature_matrix(
     targets = _build_target_rows(
         history, inference_season, forecast_horizon,
         include_inactive_targets=include_inactive_targets,
+    ).with_columns(_is_rookie_anchor=pl.lit(0, dtype=pl.Int8))
+
+    rookie_rows = _build_rookie_anchor_rows(
+        history, rookies, inference_season, forecast_horizon,
+        include_inactive_targets=include_inactive_targets,
     )
+    if rookie_rows is not None:
+        targets = pl.concat([targets, rookie_rows], how="diagonal")
 
     # Lagged FP and games from anchor_season backwards.
     out = targets
@@ -385,17 +489,29 @@ def build_feature_matrix(
     if draft_features is not None:
         out = _join_draft(out, draft_features)
 
-    # Filter training rookies (no history). Inference rows are always kept.
+    # `is_rookie` = 1 for synthetic pre-rookie anchors (experience == 0 by
+    # construction), 0 for veterans. Lets the model branch cleanly instead of
+    # having to infer rookie-ness from the pattern of nulls.
+    out = out.with_columns(
+        is_rookie=pl.col("_is_rookie_anchor").fill_null(0).cast(pl.Int8),
+    )
+
+    # Master filter: keep inference rows always, rookie-anchor rows (no NFL
+    # history by definition), and veteran training rows with sufficient
+    # observed history.
     out = out.with_columns(
         _has_history=pl.col("prior_fp_1y").is_not_null()
             | pl.col("prior_fp_2y").is_not_null()
             | pl.col("prior_fp_3y").is_not_null(),
         _is_inference=pl.col("target_fp").is_null(),
     )
-    out = out.filter(pl.col("_is_inference") | (pl.col("_has_history") &
-                     (pl.col("experience") >= min_prior_seasons)))
+    out = out.filter(
+        pl.col("_is_inference")
+        | (pl.col("is_rookie") == 1)
+        | (pl.col("_has_history") & (pl.col("experience") >= min_prior_seasons))
+    )
 
     # `season` alias to target_season for backward compat.
-    return out.drop(["_has_history", "_is_inference"]).with_columns(
+    return out.drop(["_has_history", "_is_inference", "_is_rookie_anchor"]).with_columns(
         season=pl.col("target_season"),
     )

@@ -116,6 +116,7 @@ def career_calibration_at_anchor(
     horizon: int,
     league: LeagueConfig,
     scoring: ScoringConfig,
+    rookies: pl.DataFrame | None = None,
     n_simulations: int = 1000,
     discount_rate: float = 0.15,
     model_params: dict | None = None,
@@ -131,15 +132,21 @@ def career_calibration_at_anchor(
     """
     train_ps = player_seasons.filter(pl.col("season") <= anchor_season)
     train_adv = advanced_features.filter(pl.col("season") <= anchor_season)
+    rookies_train = (
+        rookies.filter(pl.col("draft_year") <= anchor_season)
+        if rookies is not None else None
+    )
 
     fm_train = build_feature_matrix(
         train_ps, scoring,
         advanced_features=train_adv, draft_features=draft_features,
+        rookies=rookies_train,
         forecast_horizon=horizon, include_inactive_targets=True,
     )
     fm_inf = build_feature_matrix(
         train_ps, scoring,
         advanced_features=train_adv, draft_features=draft_features,
+        rookies=rookies,
         inference_season=anchor_season + 1, forecast_horizon=horizon,
         include_inactive_targets=True,
     )

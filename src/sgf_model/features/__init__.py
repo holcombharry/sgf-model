@@ -12,6 +12,7 @@ from sgf_model.features.advanced import (
     compute_ngs_receiving_features,
     compute_ngs_rushing_features,
     compute_route_features,
+    compute_rookies,
     compute_snap_features,
 )
 from sgf_model.features.builder import (
@@ -31,6 +32,7 @@ __all__ = [
     "compute_ngs_receiving_features",
     "compute_ngs_rushing_features",
     "compute_route_features",
+    "compute_rookies",
     "compute_snap_features",
     "PHASE1_FEATURE_COLUMNS",
     "PHASE2_FEATURE_COLUMNS",

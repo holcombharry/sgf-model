@@ -350,6 +350,7 @@ def project_for_backtest_v2(
     scoring: ScoringConfig,
     advanced_features: pl.DataFrame | None = None,
     draft_features: pl.DataFrame | None = None,
+    rookies: pl.DataFrame | None = None,
     feature_columns: tuple[str, ...] = PHASE1_FEATURE_COLUMNS,
     model_params: dict | None = None,
     random_state: int = 42,
@@ -378,16 +379,26 @@ def project_for_backtest_v2(
         advanced_features.filter(pl.col("season") <= test_season - 1)
         if advanced_features is not None else None
     )
+    # Rookies whose draft_year > test_season - 1 would leak (their actual rookie
+    # outcomes happened after the training cutoff). Filter the training-side
+    # rookies frame to drafts strictly within the training window; pass the full
+    # frame at inference so test_season's incoming rookies get projected.
+    rookies_train = (
+        rookies.filter(pl.col("draft_year") <= test_season - 1)
+        if rookies is not None else None
+    )
     training_matrix = build_feature_matrix(
         train_ps, scoring,
         advanced_features=advanced_train,
         draft_features=draft_features,
+        rookies=rookies_train,
     )
     inference_matrix = build_feature_matrix(
         train_ps, scoring,
         inference_season=test_season,
         advanced_features=advanced_train,
         draft_features=draft_features,
+        rookies=rookies,
     ).filter(pl.col("target_fp").is_null())
 
     model = QuantileFPModel(
@@ -406,6 +417,7 @@ def run_backtest_v2(
     scoring: ScoringConfig,
     advanced_features: pl.DataFrame | None = None,
     draft_features: pl.DataFrame | None = None,
+    rookies: pl.DataFrame | None = None,
 ) -> pl.DataFrame:
     """Run the v2 backtest matrix.
 
@@ -430,6 +442,7 @@ def run_backtest_v2(
                 player_seasons, test_season, scoring,
                 advanced_features=advanced_features,
                 draft_features=draft_features,
+                rookies=rookies,
                 **variant_kwargs,
             )
             merged = evaluate_predictions(scored, actuals, eligible_player_ids=eligible)
