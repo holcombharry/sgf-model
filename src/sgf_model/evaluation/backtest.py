@@ -2,11 +2,9 @@
 to actuals, and report per-position error, rank quality, and calibration coverage.
 
 For each test season T:
-    - Train on player_seasons / weekly through T-1.
-    - Refit age curves, regression priors, history baselines from training only.
-    - Project T (one season ahead).
-    - Fit per-position residual sigma on a held-out projection of T-1, build
-      predictive intervals on the T projections.
+    - Train on player_seasons through T-1.
+    - Fit the per-position quantile FP model on training-only data.
+    - Project T (one season ahead, or multi-year per `forecast_horizon`).
     - Compare to actuals for players who played; split by healthy/injured.
 
 Metrics reported per (test_season, variant, injury_bucket, position):
@@ -26,13 +24,11 @@ import numpy as np
 import polars as pl
 from scipy.stats import spearmanr
 
-from sgf_model.curves import fit_age_curves
 from sgf_model.features import (
     PHASE1_FEATURE_COLUMNS,
     build_feature_matrix,
 )
 from sgf_model.models import QuantileFPModel
-from sgf_model.projections import fit_regression_priors, project_players
 from sgf_model.scoring import ScoringConfig, score_projections
 
 DEFAULT_TOP_NS: tuple[int, ...] = (12, 24, 36)
@@ -56,40 +52,6 @@ _ACTUAL_STAT_COLS: tuple[str, ...] = (
 )
 
 
-def project_for_backtest(
-    player_seasons: pl.DataFrame,
-    weekly_stats: pl.DataFrame,
-    test_season: int,
-    use_regression: bool = True,
-    n_multiplier: float = 1.0,
-    history_weights: tuple[float, ...] = (5.0, 4.0, 3.0),
-) -> pl.DataFrame:
-    """One-season-ahead projection using only data through `test_season - 1`.
-
-    Refits age curves and regression priors on training data only — no leakage
-    from the test season.
-    """
-    as_of = test_season - 1
-    train_ps = player_seasons.filter(pl.col("season") <= as_of)
-    train_weekly = weekly_stats.filter(pl.col("season") <= as_of)
-
-    curves = fit_age_curves(train_ps)
-    priors = None
-    if use_regression:
-        priors = fit_regression_priors(train_weekly, as_of_season=as_of)
-        if n_multiplier != 1.0:
-            priors = priors.with_columns(regression_n=pl.col("regression_n") * n_multiplier)
-
-    return project_players(
-        train_ps,
-        curves,
-        as_of_season=as_of,
-        n_future_seasons=1,
-        history_weights=history_weights,
-        regression_priors=priors,
-    )
-
-
 def score_actuals_for_backtest(
     player_seasons: pl.DataFrame,
     test_season: int,
@@ -102,77 +64,6 @@ def score_actuals_for_backtest(
 
 
 HEALTHY_GAMES_THRESHOLD: int = 8
-
-# Gaussian z-scores for two-sided predictive intervals at common levels.
-# 50% interval covers ±0.6745 sigma (the interquartile range under a normal),
-# 80% covers ±1.2816. We default to these two — narrow tells you "is the median
-# centered well?", wide tells you "are we honest about uncertainty?".
-INTERVAL_Z: dict[float, float] = {0.5: 0.6745, 0.8: 1.2816}
-DEFAULT_INTERVAL_LEVELS: tuple[float, ...] = (0.5, 0.8)
-
-
-def fit_residual_sigmas(
-    player_seasons: pl.DataFrame,
-    weekly_stats: pl.DataFrame,
-    ref_season: int,
-    scoring: ScoringConfig,
-    **proj_kwargs,
-) -> dict[str, float]:
-    """Per-position residual SD from a held-out one-step-ahead projection at `ref_season`.
-
-    The intervals are intentionally simple (one sigma per position, Gaussian) and
-    will be replaced by comp-based predictive distributions in Phase 4. The point
-    of having them now is so we can track calibration coverage from day 1 — any
-    future improvement to the projection model can be measured against this baseline.
-
-    `ref_season` should be the most recent season *before* the test season being
-    evaluated, so no information from the test set leaks into the sigma estimate.
-    """
-    proj = project_for_backtest(
-        player_seasons, weekly_stats, test_season=ref_season, **proj_kwargs
-    )
-    scored = score_projections(proj, scoring)
-    actuals = score_actuals_for_backtest(player_seasons, ref_season, scoring)
-    merged = evaluate_predictions(scored, actuals)
-    sigmas: dict[str, float] = {}
-    for (pos,) in merged.select("position").unique().iter_rows():
-        sub = merged.filter(pl.col("position") == pos)
-        if sub.height < 5:
-            continue
-        sigmas[pos] = float(np.sqrt((sub["error"].to_numpy() ** 2).mean()))
-    return sigmas
-
-
-def attach_intervals(
-    scored: pl.DataFrame,
-    sigmas: dict[str, float],
-    levels: tuple[float, ...] = DEFAULT_INTERVAL_LEVELS,
-) -> pl.DataFrame:
-    """Add `proj_fp_lower_{pct}` / `proj_fp_upper_{pct}` columns to a scored projection.
-
-    Uses a Gaussian approximation with per-position sigma. Players in positions
-    not present in `sigmas` (rare — only happens if the training sample is tiny)
-    get null interval columns.
-    """
-    if not sigmas:
-        return scored
-    sigma_df = pl.DataFrame({
-        "position": list(sigmas.keys()),
-        "_sigma_fp": list(sigmas.values()),
-    })
-    out = scored.join(sigma_df, on="position", how="left")
-    for level in levels:
-        if level not in INTERVAL_Z:
-            raise ValueError(f"No z-score defined for level {level}. Add to INTERVAL_Z.")
-        z = INTERVAL_Z[level]
-        pct = int(round(level * 100))
-        out = out.with_columns(
-            (pl.col("fantasy_points_season") - z * pl.col("_sigma_fp"))
-                .alias(f"proj_fp_lower_{pct}"),
-            (pl.col("fantasy_points_season") + z * pl.col("_sigma_fp"))
-                .alias(f"proj_fp_upper_{pct}"),
-        )
-    return out.drop("_sigma_fp")
 
 
 def eligible_player_ids(
@@ -355,23 +246,19 @@ def project_for_backtest_v2(
     model_params: dict | None = None,
     random_state: int = 42,
 ) -> pl.DataFrame:
-    """v2 top-down projection: feature matrix + per-position quantile FP model.
+    """Top-down projection: feature matrix + per-position quantile FP model.
 
     Trains the QuantileFPModel on data through `test_season - 1` (no leakage)
-    and emits inference predictions for `test_season`. Output schema matches
-    the v1 path: `fantasy_points_season` plus `proj_fp_lower_50` /
-    `proj_fp_upper_50` / `proj_fp_lower_80` / `proj_fp_upper_80`.
+    and emits inference predictions for `test_season`. Output columns:
+    `fantasy_points_season` (median) plus `proj_fp_lower_50` / `proj_fp_upper_50`
+    / `proj_fp_lower_80` / `proj_fp_upper_80` quantile intervals.
 
-    The v2 model's intervals are quantile-emitted directly — no `attach_intervals`
-    post-processing needed (and `fit_residual_sigmas` is not called).
+    `advanced_features` / `draft_features` / `rookies` are passed straight to
+    `build_feature_matrix` so feature-set variants can be tested cheaply. They
+    can be built once and reused across test seasons.
 
-    `advanced_features` / `draft_features` are passed straight to
-    `build_feature_matrix` to enable Phase 2+ feature sets. They can be built
-    once and reused across test seasons.
-
-    `feature_columns` selects which columns the model consumes — this is how
-    Phase 1 (PHASE1_FEATURE_COLUMNS) and Phase 2 (PHASE2_FEATURE_COLUMNS)
-    variants share the same feature-matrix infrastructure.
+    `feature_columns` selects which columns the model consumes (PHASE1 through
+    PHASE5 + is_rookie share the same feature-matrix infrastructure).
     """
     train_ps = player_seasons.filter(pl.col("season") <= test_season - 1)
     # Filter advanced features to the training window too — no leakage from T or later.
@@ -419,19 +306,19 @@ def run_backtest_v2(
     draft_features: pl.DataFrame | None = None,
     rookies: pl.DataFrame | None = None,
 ) -> pl.DataFrame:
-    """Run the v2 backtest matrix.
+    """Run the backtest matrix across the supplied test seasons + variants.
 
     `variants` maps a variant name to kwargs for `project_for_backtest_v2`
-    (typically `{"feature_columns": PHASE2_FEATURE_COLUMNS}` or
+    (typically `{"feature_columns": PHASE5_FEATURE_COLUMNS}` or
     `{"model_params": {...}}`).
 
-    `advanced_features` / `draft_features` apply to all variants — typically
-    built once via `build_advanced_features` and `compute_draft_features` and
-    passed in here. Variants then opt into using them via `feature_columns`.
+    `advanced_features` / `draft_features` / `rookies` apply to all variants
+    — built once via `build_advanced_features` / `compute_draft_features` /
+    `compute_rookies` and shared across variants. Variants opt into using them
+    by selecting the appropriate `feature_columns`.
 
-    Same return schema as `run_backtest`. Concatenable with v1 results for
-    direct comparison — the `variant` column distinguishes which model produced
-    which row.
+    Output is per (test_season, variant, injury_bucket, position). The
+    `variant` column distinguishes which model produced which row.
     """
     parts: list[pl.DataFrame] = []
     for test_season in test_seasons:
@@ -446,57 +333,6 @@ def run_backtest_v2(
                 **variant_kwargs,
             )
             merged = evaluate_predictions(scored, actuals, eligible_player_ids=eligible)
-            summary = summarize_errors_by_bucket(merged).with_columns(
-                test_season=pl.lit(test_season),
-                variant=pl.lit(variant_name),
-            )
-            parts.append(summary)
-
-    out = pl.concat(parts)
-    base_cols = ["test_season", "variant", "injury_bucket", "position", "n_players",
-                 "mae", "rmse", "mean_bias", "spearman"]
-    hit_cols = [c for c in out.columns if c.startswith("top") and c.endswith("_hit")]
-    cov_cols = [c for c in out.columns if c.startswith("cov_")]
-    return out.select(base_cols + hit_cols + cov_cols)
-
-
-def run_backtest(
-    player_seasons: pl.DataFrame,
-    weekly_stats: pl.DataFrame,
-    test_seasons: list[int],
-    variants: dict[str, dict],
-    scoring: ScoringConfig,
-) -> pl.DataFrame:
-    """Run the backtest matrix and return a long-format error summary.
-
-    `variants` maps a variant name to kwargs for `project_for_backtest`
-    (typically `{"use_regression": ..., "n_multiplier": ...}`).
-
-    Returns:
-        DataFrame with columns:
-            test_season | variant | position | n_players | mae | rmse | mean_bias
-    """
-    parts: list[pl.DataFrame] = []
-    for test_season in test_seasons:
-        actuals = score_actuals_for_backtest(player_seasons, test_season, scoring)
-        eligible = eligible_player_ids(player_seasons, test_season)
-        for variant_name, variant_kwargs in variants.items():
-            proj = project_for_backtest(
-                player_seasons, weekly_stats, test_season, **variant_kwargs
-            )
-            scored = score_projections(proj, scoring)
-            # Fit per-position residual sigma on a held-out projection of test_season - 1.
-            # Uses the same variant kwargs so the sigma estimate is variant-specific.
-            sigmas = fit_residual_sigmas(
-                player_seasons, weekly_stats,
-                ref_season=test_season - 1,
-                scoring=scoring,
-                **variant_kwargs,
-            )
-            scored_with_intervals = attach_intervals(scored, sigmas)
-            merged = evaluate_predictions(
-                scored_with_intervals, actuals, eligible_player_ids=eligible
-            )
             summary = summarize_errors_by_bucket(merged).with_columns(
                 test_season=pl.lit(test_season),
                 variant=pl.lit(variant_name),

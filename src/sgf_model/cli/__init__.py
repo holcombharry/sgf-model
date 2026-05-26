@@ -1,1 +1,0 @@
-"""sgf CLI: rank, snapshots."""

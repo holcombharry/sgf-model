@@ -1,7 +1,7 @@
 [project]
 name = "sgf-model"
 version = "0.1.0"
-description = "Dynasty fantasy football valuation from forecasted production. Bottom-up stat projections with pluggable league scoring."
+description = "Dynasty fantasy football valuation: top-down quantile FP model + Monte Carlo career VORP."
 authors = [
     { name = "Harry Holcomb", email = "31421567+holcombharry@users.noreply.github.com" }
 ]
@@ -11,14 +11,9 @@ dependencies = [
     "polars>=1.0",
     "numpy>=1.26",
     "scipy>=1.13",
-    "typer>=0.12",
     "pymongo>=4.0",
-    "streamlit>=1.36",
     "scikit-learn>=1.5",
 ]
-
-[project.scripts]
-sgf = "sgf_model.cli.main:app"
 
 [dependency-groups]
 dev = [

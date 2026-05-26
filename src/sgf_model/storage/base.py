@@ -32,9 +32,7 @@ class Snapshot:
     n_future_seasons: int
     league_config: dict[str, Any]
     scoring_config: dict[str, Any]
-    history_weights: list[float]
     discount_rate: float
-    use_regression: bool
     team_overrides: dict[str, str]
     rankings: list[dict[str, Any]]
     notes: str = ""
