@@ -224,16 +224,25 @@ def _build_target_rows(
     history: pl.DataFrame,
     inference_season: int | None,
     forecast_horizon: int,
+    include_inactive_targets: bool = True,
 ) -> pl.DataFrame:
     """Enumerate (player, anchor_season, future_offset) → target_season rows.
 
     Training rows: every historical (player, anchor_season) gets one row per
-    valid offset in 1..forecast_horizon where target_season = anchor_season + offset
-    has a realized FP for that player. Player-season pairs without realized FP
-    at target_season are dropped (they don't contribute to training).
+    valid offset in 1..forecast_horizon where target_season = anchor_season + offset.
 
-    Inference rows: a single anchor_season = inference_season - 1 with one row
-    per offset in 1..forecast_horizon, target_fp null.
+    When `include_inactive_targets=True` (default since Phase 4): if the player
+    has no recorded FP at target_season but the season is within the training
+    data window, we add the row with `target_fp = 0` — modeling "player was
+    inactive that year" (retired, cut, season-long injury). Without this fix,
+    the model only sees survivors at older ages, and survivorship bias produces
+    unrealistically flat aging curves. See docs/phase4-retirement-fix.md.
+
+    Target seasons beyond the training window (i.e., > max(history.season)) are
+    dropped — we can't tell future-season activity from missing data.
+
+    Inference rows: anchor_season = inference_season - 1, one row per offset,
+    target_fp null.
     """
     anchors = history.select(
         "player_id", "player_name", "position", "birth_date",
@@ -245,22 +254,50 @@ def _build_target_rows(
         target_season=pl.col("anchor_season") + pl.col("future_offset"),
     )
 
-    # Pull realized target FP if it exists. Inner join — drops anchors+offsets
-    # where the player didn't actually play at target_season (so we don't train
-    # on zero-FP retirement seasons that aren't in the data; this is a known
-    # limitation discussed in docs/phase3-results.md).
     target_fps = history.select(
         "player_id",
         pl.col("season").alias("target_season"),
         pl.col("fp_season").alias("target_fp"),
     )
-    train_rows = train_rows.join(target_fps, on=["player_id", "target_season"], how="inner")
+
+    if include_inactive_targets:
+        # Left join to keep all (anchor, offset) pairs; restrict to in-window;
+        # fill missing target_fp with 0 to flag inactive seasons.
+        last_training_season = int(history["season"].max())
+        train_rows = (
+            train_rows.join(target_fps, on=["player_id", "target_season"], how="left")
+            .filter(pl.col("target_season") <= last_training_season)
+            .with_columns(target_fp=pl.col("target_fp").fill_null(0.0))
+        )
+
+        # Keep only the FIRST inactive season per (player, anchor_season). The
+        # transition from active → inactive is the informative signal; including
+        # every subsequent zero is redundant and overwhelms the model with mass
+        # zeros, dragging the median below replacement for any retirement-adjacent
+        # feature pattern. Active rows are always kept.
+        train_rows = train_rows.with_columns(
+            _is_inactive=(pl.col("target_fp") == 0).cast(pl.Int8),
+        )
+        train_rows = train_rows.with_columns(
+            _first_inactive_offset=pl.col("future_offset")
+                .filter(pl.col("_is_inactive") == 1)
+                .min()
+                .over(["player_id", "anchor_season"]),
+        )
+        train_rows = train_rows.filter(
+            (pl.col("_is_inactive") == 0)
+            | (pl.col("future_offset") == pl.col("_first_inactive_offset"))
+        ).drop(["_is_inactive", "_first_inactive_offset"])
+    else:
+        # Legacy (pre-Phase-4) inner-join semantic — only realized FP rows.
+        train_rows = train_rows.join(
+            target_fps, on=["player_id", "target_season"], how="inner"
+        )
 
     if inference_season is None:
         return train_rows
 
-    # Inference: build rows for inference_season + (offset - 1) where anchor is
-    # inference_season - 1. Active = played in inference_season - 1.
+    # Inference: active = played in inference_season - 1.
     active = history.filter(pl.col("season") == inference_season - 1).select(
         "player_id", "player_name", "position", "birth_date",
         pl.col("season").alias("anchor_season"),
@@ -280,6 +317,7 @@ def build_feature_matrix(
     min_prior_seasons: int = 1,
     advanced_features: pl.DataFrame | None = None,
     draft_features: pl.DataFrame | None = None,
+    include_inactive_targets: bool = True,
 ) -> pl.DataFrame:
     """Build the (player, anchor_season, future_offset) feature matrix.
 
@@ -308,7 +346,10 @@ def build_feature_matrix(
         emitted so downstream code that filters/groups on `season` still works.
     """
     history = _score_history(player_seasons, scoring)
-    targets = _build_target_rows(history, inference_season, forecast_horizon)
+    targets = _build_target_rows(
+        history, inference_season, forecast_horizon,
+        include_inactive_targets=include_inactive_targets,
+    )
 
     # Lagged FP and games from anchor_season backwards.
     out = targets
