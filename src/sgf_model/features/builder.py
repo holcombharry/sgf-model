@@ -88,6 +88,13 @@ PHASE5_ROUTES_COLUMNS: tuple[str, ...] = (
 )
 PHASE5_FEATURE_COLUMNS: tuple[str, ...] = PHASE3_FEATURE_COLUMNS + PHASE5_ROUTES_COLUMNS
 
+# Career-direct training uses one row per (player, anchor) with target =
+# realized career VORP, so `future_offset` is constant 1 and carries no signal.
+# Dropped here to avoid wasting a feature slot.
+CAREER_FEATURE_COLUMNS: tuple[str, ...] = tuple(
+    c for c in PHASE5_FEATURE_COLUMNS if c != "future_offset"
+)
+
 
 _STAT_COLS_RENAME: dict[str, str] = {
     "passing_yards": "passing_yards_season",
@@ -515,3 +522,54 @@ def build_feature_matrix(
     return out.drop(["_has_history", "_is_inference", "_is_rookie_anchor"]).with_columns(
         season=pl.col("target_season"),
     )
+
+
+def build_career_feature_matrix(
+    player_seasons: pl.DataFrame,
+    scoring: ScoringConfig,
+    career_targets: pl.DataFrame,
+    inference_season: int | None = None,
+    min_prior_seasons: int = 1,
+    advanced_features: pl.DataFrame | None = None,
+    draft_features: pl.DataFrame | None = None,
+    rookies: pl.DataFrame | None = None,
+) -> pl.DataFrame:
+    """One-row-per-(player, anchor) matrix for direct career-VORP training.
+
+    Wraps `build_feature_matrix(forecast_horizon=1)` to get the full feature
+    set per (player, anchor), then swaps the per-year FP target for the
+    realized career VORP target from `career_targets`.
+
+    Training rows: those where the joined `target_career_vorp` is non-null
+    (i.e., anchor + horizon falls inside the data window).
+
+    Inference rows: anchor = inference_season - 1, target null. The caller
+    consumes these to predict next-anchor career VORP distributions.
+
+    `career_targets`: output of `compute_career_vorp_targets`. Joined on
+    (player_id, anchor_season).
+    """
+    # Reuse the per-year builder for feature construction, then strip the
+    # per-year target and substitute the career-VORP target.
+    fm = build_feature_matrix(
+        player_seasons, scoring,
+        inference_season=inference_season,
+        forecast_horizon=1,
+        min_prior_seasons=min_prior_seasons,
+        advanced_features=advanced_features,
+        draft_features=draft_features,
+        rookies=rookies,
+    ).drop("target_fp")
+
+    out = fm.join(career_targets, on=["player_id", "anchor_season"], how="left")
+    # Keep training rows with a realized career VORP, plus the explicit
+    # inference rows (anchor = inference_season - 1).
+    if inference_season is not None:
+        is_inference = pl.col("anchor_season") == inference_season - 1
+        out = out.filter(is_inference | pl.col("target_career_vorp").is_not_null())
+    else:
+        out = out.filter(pl.col("target_career_vorp").is_not_null())
+
+    # Standardize the target column name so the existing QuantileFPModel
+    # (which reads `target_fp`) can train on it without modification.
+    return out.rename({"target_career_vorp": "target_fp"})

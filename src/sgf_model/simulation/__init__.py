@@ -1,25 +1,11 @@
-"""Career Monte Carlo simulator and master ranking — the Phase 3 product.
+"""Career-VORP target computation from realized history.
 
-Takes multi-year quantile FP predictions and produces:
-    - sampled career FP trajectories (rank-coupled across years)
-    - per-sample career VORP (using sample-specific position replacement levels)
-    - master ranking with configurable risk-adjusted score
+Module name is historical — the Monte Carlo simulator was decommissioned in
+Phase 7 once direct career-VORP training matched its rank quality with a
+simpler pipeline. What remains is the realized-target helper that the
+direct-training feature builder consumes.
 """
 
-from sgf_model.simulation.career import (
-    DEFAULT_N_SIMULATIONS,
-    DEFAULT_RANKING_SCORES,
-    sample_career_fps,
-    sample_career_vorps,
-    summarize_career,
-    master_ranking,
-)
+from sgf_model.simulation.career_target import compute_career_vorp_targets
 
-__all__ = [
-    "DEFAULT_N_SIMULATIONS",
-    "DEFAULT_RANKING_SCORES",
-    "sample_career_fps",
-    "sample_career_vorps",
-    "summarize_career",
-    "master_ranking",
-]
+__all__ = ["compute_career_vorp_targets"]
